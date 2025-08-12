@@ -1,18 +1,37 @@
-// mail.js (modo prueba)
-const fs = require('fs');
-const path = require('path');
+// mail.js
+require('dotenv').config();
+const formData = require('form-data');
+const Mailgun = require('mailgun.js');
+const mg = new Mailgun(formData);
+
+const client = mg.client({
+  username: 'api',
+  key: process.env.MAILGUN_API_KEY,
+});
 
 async function sendDiplomaEmail({ to, subject, html, text, pdfBuffer, filename = 'Diploma.pdf' }) {
-  console.log(`📧 [SIMULADO] Enviando a: ${to}`);
-  console.log(`Asunto: ${subject}`);
-  console.log(`Texto: ${text}`);
-  
-  // Guardar en disco para verificar
-  const outPath = path.join(__dirname, 'test-output.pdf');
-  fs.writeFileSync(outPath, pdfBuffer);
-  console.log(`✅ PDF guardado en: ${outPath}`);
+  try {
+    const messageData = {
+      from: process.env.MAIL_FROM,
+      to,
+      subject,
+      text,
+      html,
+      attachment: [
+        {
+          filename,
+          data: pdfBuffer
+        }
+      ]
+    };
 
-  return { id: 'test123', status: 'queued' };
+    const result = await client.messages.create(process.env.MAILGUN_DOMAIN, messageData);
+    console.log(`✅ Correo enviado a ${to} (ID: ${result.id})`);
+    return result;
+  } catch (error) {
+    console.error(`❌ Error enviando correo a ${to}:`, error);
+    throw error;
+  }
 }
 
 module.exports = { sendDiplomaEmail };

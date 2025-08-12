@@ -13,6 +13,16 @@ app.use(express.json({ limit: '1mb' }));
 app.use(morgan('tiny'));
 
 const PORT = process.env.PORT || 8080;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+
+function verifySecret(req, res, next) {
+  if (!WEBHOOK_SECRET) return next();
+  const incoming = req.header('X-Webhook-Secret') || '';
+  if (incoming !== WEBHOOK_SECRET) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+  next();
+}
 
 app.get('/', (req, res) => {
   res.json({ ok: true, service: 'cert-mailer', time: new Date().toISOString() });
@@ -34,12 +44,17 @@ app.get('/api/preview', async (req, res) => {
   }
 });
 
-// Webhook/endpoint para emitir y enviar diploma
+// Emite y envía diploma (protege con secret si está configurado)
 app.post('/api/issue-cert', async (req, res) => {
   try {
+    // Validar secreto del webhook
+    const incomingSecret = req.headers['x-webhook-secret'] || req.query.secret;
+    if (incomingSecret !== process.env.WEBHOOK_SECRET) {
+      return res.status(403).json({ ok: false, error: 'No autorizado' });
+    }
+
     const { name, email } = req.body || {};
 
-    // Validación básica
     const cleanName = (name || '').toString().trim();
     const cleanEmail = (email || '').toString().trim().toLowerCase();
 
@@ -51,21 +66,17 @@ app.post('/api/issue-cert', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Email inválido' });
     }
 
-    // Generar PDF
     const pdfBuffer = await generateDiplomaBuffer({ name: cleanName });
 
-    // Contenido del correo
-    const subject = `${process.env.EVENT_SUBTITLE || 'Diploma'} - ${process.env.EVENT_TITLE || 'Evento'}`;
+    const subject = 'Diploma de participación';
     const html = `
       <p>Hola <strong>${escapeHtml(cleanName)}</strong>,</p>
-      <p>¡Gracias por participar en <strong>${escapeHtml(process.env.EVENT_TITLE || 'nuestro evento')}</strong>!</p>
       <p>Adjunto encontrarás tu <strong>diploma de participación</strong>.</p>
-      <p>Saludos,<br>${escapeHtml(process.env.ORG_NAME || 'Organización')}</p>
+      <p>Saludos.</p>
     `;
     const text = `Hola ${cleanName},
-Gracias por participar en ${process.env.EVENT_TITLE || 'nuestro evento'}.
 Adjunto encontrarás tu diploma de participación.
-Saludos, ${process.env.ORG_NAME || 'Organización'}`;
+Saludos.`;
 
     await sendDiplomaEmail({
       to: cleanEmail,
@@ -73,10 +84,9 @@ Saludos, ${process.env.ORG_NAME || 'Organización'}`;
       html,
       text,
       pdfBuffer,
-      filename: `Diploma - ${cleanName}.pdf`,
+      filename: `Diploma - ${cleanName}.pdf`
     });
 
-    // Listo
     res.status(202).json({ ok: true, message: 'Enviado' });
   } catch (err) {
     console.error(err);
