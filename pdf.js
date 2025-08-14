@@ -5,6 +5,7 @@ const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
+const { Resvg } = require('@resvg/resvg-js');
 
 // ==== Utilidades de medidas ====
 function mm(n) { return n * 2.83465; } // 1 mm ≈ 2.83465 pt
@@ -24,12 +25,9 @@ const NAME_Y_MM = TOP_Y_MM + NAME_OFFSET_Y_MM;
 const SIDE_MARGIN_TOTAL_MM = 30; // 30 mm total (≈15 mm por lado)
 const MAX_TEXT_WIDTH_MM = PAGE_W_MM - SIDE_MARGIN_TOTAL_MM;
 
-// ==== Fuente embebida en SVG ====
+// ==== Fuente embebida ====
 const FONT_PATH = path.join(__dirname, 'assets', 'fonts', 'NotoSerif-Regular.ttf');
-const FALLBACK_FONT_FAMILY = 'serif'; // por si falta el TTF (no recomendado)
-
-// Forzar ajuste de ancho por SVG (puede distorsionar acentos en algunos motores)
-const USE_TEXT_LENGTH = false;
+const FALLBACK_FONT_FAMILY = 'serif'; // solo por si falta el TTF (no recomendado)
 
 // Tamaño base de la letra en píxeles (para el SVG)
 const BASE_FONT_PX = 100;
@@ -44,81 +42,76 @@ function autosizeFontPx(name) {
   return Math.round(BASE_FONT_PX * 0.65);
 }
 
+// Escapar caracteres especiales XML para el contenido del <text>
+function escapeXml(s) {
+  return String(s).replace(/[&<>"']/g, m => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));
+}
+
+// Renderiza la capa de texto (SVG) a PNG usando Resvg (soporta @font-face data:)
+// widthPx/heightPx: tamaño del PNG fondo
+async function renderTextLayerPng({ widthPx, heightPx, yPx, name, fontPx }) {
+  let fontBase64 = null;
+  if (fs.existsSync(FONT_PATH)) {
+    fontBase64 = fs.readFileSync(FONT_PATH).toString('base64');
+  } else {
+    console.warn('[pdf.js] No se encontró la fuente TTF en', FONT_PATH, '— se usará fallback del sistema (puede fallar con tildes).');
+  }
+
+  const svg = `
+  <svg width="${widthPx}" height="${heightPx}" viewBox="0 0 ${widthPx} ${heightPx}" xmlns="http://www.w3.org/2000/svg">
+    <style>
+      ${fontBase64 ? `
+      @font-face {
+        font-family: 'DiplomaFont';
+        src: url('data:font/ttf;base64,${fontBase64}') format('truetype');
+        font-weight: normal; font-style: normal;
+      }` : ''}
+      text { font-family: ${fontBase64 ? "'DiplomaFont'" : FALLBACK_FONT_FAMILY}; }
+    </style>
+    <text x="${Math.round(widthPx/2)}" y="${yPx}"
+          font-size="${fontPx}" fill="#131a6d"
+          text-anchor="middle" dominant-baseline="middle">
+      ${escapeXml(name)}
+    </text>
+  </svg>`;
+
+  const resvg = new Resvg(svg, { fitTo: { mode: 'original' } });
+  const pngData = resvg.render().asPng(); // Buffer PNG
+  return pngData;
+}
+
 function generateDiplomaBuffer({ name }) {
   return new Promise(async (resolve, reject) => {
     try {
+      // Normaliza a NFC para acentos compuestos (muy importante)
+      name = (name || '').toString().trim().normalize('NFC');
+      if (!name) throw new Error('El nombre es obligatorio');
+
       // 1) Cargar fondo
       const bgPath = path.join(__dirname, 'assets', 'cert.png');
-      let flattenedPng;
-
-      // Lee fuente y pasa a base64
-      let fontBase64 = null;
-      if (fs.existsSync(FONT_PATH)) {
-        fontBase64 = fs.readFileSync(FONT_PATH).toString('base64');
-      } else {
-        console.warn('[pdf.js] No se encontró la fuente TTF en', FONT_PATH, '— se usará fallback del sistema (puede fallar con tildes).');
+      if (!fs.existsSync(bgPath)) {
+        throw new Error('No se encontró assets/cert.png');
       }
 
-      if (fs.existsSync(bgPath)) {
-        const bg = sharp(bgPath);
-        const meta = await bg.metadata();
-        const widthPx = meta.width || 2794;   // fallback aprox ~300 dpi
-        const heightPx = meta.height || 2159; // fallback aprox ~300 dpi
+      const bg = sharp(bgPath);
+      const meta = await bg.metadata();
+      const widthPx = meta.width || 2794;   // fallback aprox ~300 dpi
+      const heightPx = meta.height || 2159; // fallback aprox ~300 dpi
 
-        // Posicionamiento del texto en píxeles
-        const yPx = Math.round(mmToPx(NAME_Y_MM, PAGE_H_MM, heightPx));
-        const maxTextWidthPx = Math.round(mmToPx(MAX_TEXT_WIDTH_MM, PAGE_W_MM, widthPx));
+      // Posicionamiento del texto en píxeles
+      const yPx = Math.round(mmToPx(NAME_Y_MM, PAGE_H_MM, heightPx));
+      const fontPx = autosizeFontPx(name);
 
-        // Tamaño de letra con pequeña heurística
-        const fontPx = autosizeFontPx(name);
+      // 2) Capa de texto renderizada con Resvg
+      const textLayerPng = await renderTextLayerPng({ widthPx, heightPx, yPx, name, fontPx });
 
-        // Construcción del SVG con @font-face embebido (UTF-8)
-        const fontFace = fontBase64
-          ? `
-            @font-face {
-              font-family: 'DiplomaFont';
-              src: url('data:font/ttf;base64,${fontBase64}') format('truetype');
-              font-weight: normal; font-style: normal; font-display: swap;
-            }`
-          : '';
+      // 3) Componer texto sobre el fondo con Sharp
+      const flattenedPng = await bg
+        .composite([{ input: textLayerPng, top: 0, left: 0 }])
+        .png()
+        .toBuffer();
 
-        // Atributos opcionales para encajar ancho (desactivar si rompe acentos)
-        const widthAttrs = USE_TEXT_LENGTH
-          ? ` textLength="${maxTextWidthPx}" lengthAdjust="spacingAndGlyphs"`
-          : '';
-
-        const svg = `
-          <svg width="${widthPx}" height="${heightPx}" viewBox="0 0 ${widthPx} ${heightPx}" version="1.1" xmlns="http://www.w3.org/2000/svg">
-            <defs>
-              <style type="text/css"><![CDATA[
-                ${fontFace}
-                text {
-                  font-family: ${fontBase64 ? "'DiplomaFont'" : FALLBACK_FONT_FAMILY};
-                  white-space: pre; /* preserva espacios */
-                }
-              ]]></style>
-            </defs>
-            <text
-              x="${Math.round(widthPx / 2)}"
-              y="${yPx}"
-              font-size="${fontPx}"
-              fill="#131a6d"
-              text-anchor="middle"
-              dominant-baseline="middle"${widthAttrs}
-            >${escapeXml(name)}</text>
-          </svg>`;
-
-        flattenedPng = await bg
-          .composite([{ input: Buffer.from(svg, 'utf8'), top: 0, left: 0 }])
-          .png()
-          .toBuffer();
-      } else {
-        // Si no está el PNG, crea lienzo blanco para no fallar
-        const width = 2794, height = 2159;
-        flattenedPng = await sharp({ create: { width, height, channels: 3, background: '#ffffff' } }).png().toBuffer();
-      }
-
-      // 2) Montar PDF con PDFKit usando la imagen a página completa
+      // 4) Montar PDF con PDFKit usando la imagen a página completa
       const doc = new PDFDocument({
         size: [mm(PAGE_W_MM), mm(PAGE_H_MM)],
         margins: { top: 0, bottom: 0, left: 0, right: 0 }
@@ -135,11 +128,6 @@ function generateDiplomaBuffer({ name }) {
       reject(err);
     }
   });
-}
-
-// Escapar caracteres especiales XML para el contenido del <text>
-function escapeXml(s) {
-  return String(s).replace(/[&<>"']/g, m => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));
 }
 
 module.exports = { generateDiplomaBuffer };
