@@ -1,91 +1,131 @@
 // pdf.js
+'use strict';
+
 const PDFDocument = require('pdfkit');
 const fs = require('fs');
 const path = require('path');
 const sharp = require('sharp');
 
-function mm(n) {
-  // PDFKit trabaja en puntos (72 dpi). 1 mm ≈ 2.83465 pt
-  return n * 2.83465;
+// ==== Utilidades de medidas ====
+function mm(n) { return n * 2.83465; } // 1 mm ≈ 2.83465 pt
+function mmToPx(mmValue, totalMm, totalPx) {
+  return (mmValue / totalMm) * totalPx;
 }
 
-function mmToPx(mmValue, totalMm, totalPx) {
-  // Convierte milímetros a píxeles según el tamaño real del PNG
-  return (mmValue / totalMm) * totalPx;
+// ==== Página (Carta apaisado) ====
+const PAGE_W_MM = 279.4;
+const PAGE_H_MM = 215.9;
+
+// ==== Layout del nombre (ajusta a tu diseño) ====
+const TOP_Y_MM = 20;           // margen superior
+const NAME_OFFSET_Y_MM = 70;   // desplazamiento desde TOP
+const NAME_Y_MM = TOP_Y_MM + NAME_OFFSET_Y_MM;
+
+const SIDE_MARGIN_TOTAL_MM = 30; // 30 mm total (≈15 mm por lado)
+const MAX_TEXT_WIDTH_MM = PAGE_W_MM - SIDE_MARGIN_TOTAL_MM;
+
+// ==== Fuente embebida en SVG ====
+const FONT_PATH = path.join(__dirname, 'assets', 'fonts', 'NotoSerif-Regular.ttf');
+const FALLBACK_FONT_FAMILY = 'serif'; // por si falta el TTF (no recomendado)
+
+// Forzar ajuste de ancho por SVG (puede distorsionar acentos en algunos motores)
+const USE_TEXT_LENGTH = false;
+
+// Tamaño base de la letra en píxeles (para el SVG)
+const BASE_FONT_PX = 100;
+
+// Heurística simple para escalar tamaño de letra según longitud del nombre
+function autosizeFontPx(name) {
+  const len = (name || '').length;
+  if (len <= 26) return BASE_FONT_PX;
+  if (len <= 36) return Math.round(BASE_FONT_PX * 0.9);
+  if (len <= 46) return Math.round(BASE_FONT_PX * 0.8);
+  if (len <= 60) return Math.round(BASE_FONT_PX * 0.72);
+  return Math.round(BASE_FONT_PX * 0.65);
 }
 
 function generateDiplomaBuffer({ name }) {
   return new Promise(async (resolve, reject) => {
     try {
-      // 1) Cargamos el fondo
+      // 1) Cargar fondo
       const bgPath = path.join(__dirname, 'assets', 'cert.png');
-
       let flattenedPng;
+
+      // Lee fuente y pasa a base64
+      let fontBase64 = null;
+      if (fs.existsSync(FONT_PATH)) {
+        fontBase64 = fs.readFileSync(FONT_PATH).toString('base64');
+      } else {
+        console.warn('[pdf.js] No se encontró la fuente TTF en', FONT_PATH, '— se usará fallback del sistema (puede fallar con tildes).');
+      }
 
       if (fs.existsSync(bgPath)) {
         const bg = sharp(bgPath);
         const meta = await bg.metadata();
-        const widthPx = meta.width || 2794;   // fallback ~300 dpi
-        const heightPx = meta.height || 2159; // fallback ~300 dpi
+        const widthPx = meta.width || 2794;   // fallback aprox ~300 dpi
+        const heightPx = meta.height || 2159; // fallback aprox ~300 dpi
 
-        // Dimensiones físicas del diseño (Carta apaisado)
-        const PAGE_W_MM = 279.4;
-        const PAGE_H_MM = 215.9;
+        // Posicionamiento del texto en píxeles
+        const yPx = Math.round(mmToPx(NAME_Y_MM, PAGE_H_MM, heightPx));
+        const maxTextWidthPx = Math.round(mmToPx(MAX_TEXT_WIDTH_MM, PAGE_W_MM, widthPx));
 
-        // === Posicionamiento y formato (igual a tu lógica anterior) ===
-        const topYmm = 20;                    // topY = mm(20)
-        const nameOffsetYmm = 70;             // + mm(70)
-        const nameYmm = topYmm + nameOffsetYmm; // 90 mm desde arriba
+        // Tamaño de letra con pequeña heurística
+        const fontPx = autosizeFontPx(name);
 
-        const sideMarginMm = 30;              // margen lateral: 30 mm
-        const maxTextWidthMm = PAGE_W_MM - sideMarginMm; // 279.4 - 30 = 249.4 mm
+        // Construcción del SVG con @font-face embebido (UTF-8)
+        const fontFace = fontBase64
+          ? `
+            @font-face {
+              font-family: 'DiplomaFont';
+              src: url('data:font/ttf;base64,${fontBase64}') format('truetype');
+              font-weight: normal; font-style: normal; font-display: swap;
+            }`
+          : '';
 
-        // Convertimos a píxeles para el PNG real
-        const yPx = Math.round(mmToPx(nameYmm, PAGE_H_MM, heightPx));
-        const maxTextWidthPx = Math.round(mmToPx(maxTextWidthMm, PAGE_W_MM, widthPx));
+        // Atributos opcionales para encajar ancho (desactivar si rompe acentos)
+        const widthAttrs = USE_TEXT_LENGTH
+          ? ` textLength="${maxTextWidthPx}" lengthAdjust="spacingAndGlyphs"`
+          : '';
 
-        // Tamaño base de letra (alto para buena presencia visual)
-        // Como el ancho lo forzaremos con textLength, no necesitamos iterar tamaños.
-        const fontPx = 100;
-
-        // SVG overlay para "pintar" el nombre dentro del PNG (aplanado)
         const svg = `
-          <svg width="${widthPx}" height="${heightPx}" viewBox="0 0 ${widthPx} ${heightPx}" xmlns="http://www.w3.org/2000/svg">
-            <style>
-              text { font-family: "Times New Roman", Times, serif; }
-            </style>
+          <svg width="${widthPx}" height="${heightPx}" viewBox="0 0 ${widthPx} ${heightPx}" version="1.1" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+              <style type="text/css"><![CDATA[
+                ${fontFace}
+                text {
+                  font-family: ${fontBase64 ? "'DiplomaFont'" : FALLBACK_FONT_FAMILY};
+                  white-space: pre; /* preserva espacios */
+                }
+              ]]></style>
+            </defs>
             <text
               x="${Math.round(widthPx / 2)}"
               y="${yPx}"
               font-size="${fontPx}"
-              fill="#131a6dff"
+              fill="#131a6d"
               text-anchor="middle"
-              dominant-baseline="middle"
-              textLength="${maxTextWidthPx}"
-              lengthAdjust="spacingAndGlyphs"
+              dominant-baseline="middle"${widthAttrs}
             >${escapeXml(name)}</text>
           </svg>`;
 
         flattenedPng = await bg
-          .composite([{ input: Buffer.from(svg), top: 0, left: 0 }])
+          .composite([{ input: Buffer.from(svg, 'utf8'), top: 0, left: 0 }])
           .png()
           .toBuffer();
       } else {
-        // Si no está el PNG, generamos lienzo blanco (para no fallar)
+        // Si no está el PNG, crea lienzo blanco para no fallar
         const width = 2794, height = 2159;
-        flattenedPng = await sharp({
-          create: { width, height, channels: 3, background: '#ffffff' }
-        }).png().toBuffer();
+        flattenedPng = await sharp({ create: { width, height, channels: 3, background: '#ffffff' } }).png().toBuffer();
       }
 
-      // 2) Insertamos la imagen a toda página en el PDF (queda una sola capa)
+      // 2) Montar PDF con PDFKit usando la imagen a página completa
       const doc = new PDFDocument({
-        size: [mm(279.4), mm(215.9)], // Carta apaisado
+        size: [mm(PAGE_W_MM), mm(PAGE_H_MM)],
         margins: { top: 0, bottom: 0, left: 0, right: 0 }
       });
 
       const chunks = [];
-      doc.on('data', (c) => chunks.push(c));
+      doc.on('data', c => chunks.push(c));
       doc.on('end', () => resolve(Buffer.concat(chunks)));
       doc.on('error', reject);
 
@@ -97,9 +137,9 @@ function generateDiplomaBuffer({ name }) {
   });
 }
 
-// Utilitario para texto en SVG
+// Escapar caracteres especiales XML para el contenido del <text>
 function escapeXml(s) {
-  return s.replace(/[&<>"']/g, (m) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));
+  return String(s).replace(/[&<>"']/g, m => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));
 }
 
 module.exports = { generateDiplomaBuffer };
